@@ -42,6 +42,7 @@
 #include "sensor_msgs/NavSatFix.h"
 #include "sensor_msgs/Temperature.h"
 #include "std_srvs/Empty.h"
+#include <std_srvs/SetBool.h>
 
 ros::Publisher pubIMU, pubMag, pubGPS, pubOdom, pubTemp, pubPres, pubIns;
 ros::ServiceServer resetOdomSrv;
@@ -58,6 +59,23 @@ using namespace vn::math;
 using namespace vn::sensors;
 using namespace vn::protocol::uart;
 using namespace vn::xplat;
+
+
+
+// using global variables to store state. not fantastic, but we dont have classes here...
+VnSensor vs;
+bool _syncout_enabled = false;
+uint64_t _syncout_counter_imu = 0;
+uint64_t _syncout_counter_driver = 0;
+std_msgs::Header _syncout_message;
+ros::Publisher _syncout_publisher;
+ros::ServiceServer _syncout_control_service;
+bool syncout_control_service(std_srvs::SetBool::Request &req, std_srvs::SetBool::Response &res);
+int SyncOutRate;// Hz
+int SyncOutLengthMS;// Milliseconds
+// Sensor IMURATE (800Hz by default, used to configure device)
+int SensorImuRate;
+
 
 // Method declarations for future use.
 void BinaryAsyncMessageReceived(void * userData, Packet & p, size_t index);
@@ -147,6 +165,59 @@ bool optimize_serial_communication(std::string portName)
 bool optimize_serial_communication(str::string portName) { return true; }
 #endif
 
+
+bool syncout_control_service(std_srvs::SetBool::Request &req, std_srvs::SetBool::Response &res)
+{
+    if(_syncout_enabled && !(bool)req.data)
+    {
+        try
+        {
+            ROS_INFO("disabling syncout on IMU");
+            vn::sensors::SynchronizationControlRegister sync_control;
+            sync_control.syncOutMode = vn::protocol::uart::SyncOutMode::SYNCOUTMODE_NONE;
+            vs.writeSynchronizationControl(sync_control);
+        }
+        catch(...)
+        {
+            res.success = false;
+            res.message = "Error disabling syncout on IMU";
+            ROS_INFO("Error disabling syncout on IMU");
+            return false;
+        }
+        _syncout_enabled = false;
+        _syncout_counter_driver = 0;
+    }
+
+    if(!_syncout_enabled && (bool)req.data)
+    {
+        try
+        {
+            ROS_INFO("enabling syncout on IMU");
+            vn::sensors::SynchronizationControlRegister sync_control;
+            sync_control.syncOutMode = vn::protocol::uart::SyncOutMode::SYNCOUTMODE_ITEMSTART;
+            sync_control.syncOutPolarity = vn::protocol::uart::SyncOutPolarity::SYNCOUTPOLARITY_POSITIVE;
+            int skip_factor = SensorImuRate / SyncOutRate - 1; // given desired rate of triggering we need to translate to how many IMU readings to skip
+            ROS_INFO("skip_factor is: %d", skip_factor);
+            ROS_INFO("pulse length is, msec: %d", SyncOutLengthMS);
+            sync_control.syncOutSkipFactor = skip_factor;
+            sync_control.syncOutPulseWidth = SyncOutLengthMS * 100000; //100000 length of trigger 0.1ms
+            vs.writeSynchronizationControl(sync_control);
+        }
+        catch(...)
+        {
+            res.success = false;
+            res.message = "Error enabling syncout on IMU";
+            ROS_INFO("Error enabling syncout on IMU");
+            return false;
+        }
+        _syncout_enabled = true;
+    }
+    res.success = true;
+    res.message = "Success";
+    return true;
+}
+
+
 int main(int argc, char * argv[])
 {
   // keeping all information passed to callback
@@ -156,6 +227,9 @@ int main(int argc, char * argv[])
   ros::init(argc, argv, "vectornav");
   ros::NodeHandle n;
   ros::NodeHandle pn("~");
+
+  _syncout_publisher = n.advertise<std_msgs::Header>("vectornav/syncout", 1);
+  _syncout_control_service = n.advertiseService("vectornav/syncout_control", &syncout_control_service);
 
   pubIMU = n.advertise<sensor_msgs::Imu>("vectornav/IMU", 1000);
   pubMag = n.advertise<sensor_msgs::MagneticField>("vectornav/Mag", 1000);
@@ -174,20 +248,19 @@ int main(int argc, char * argv[])
   int async_output_rate;
   int imu_output_rate;
 
-  // Sensor IMURATE (800Hz by default, used to configure device)
-  int SensorImuRate;
-
   // Load all params
   pn.param<std::string>("map_frame_id", user_data.map_frame_id, "map");
   pn.param<std::string>("frame_id", user_data.frame_id, "vectornav");
   pn.param<bool>("tf_ned_to_enu", user_data.tf_ned_to_enu, false);
   pn.param<bool>("frame_based_enu", user_data.frame_based_enu, false);
-  pn.param<bool>("adjust_ros_timestamp", user_data.adjust_ros_timestamp, false);
+  pn.param<bool>("adjust_ros_timestamp", user_data.adjust_ros_timestamp, true);
   pn.param<int>("async_output_rate", async_output_rate, 40);
   pn.param<int>("imu_output_rate", imu_output_rate, async_output_rate);
   pn.param<std::string>("serial_port", SensorPort, "/dev/ttyUSB0");
   pn.param<int>("serial_baud", SensorBaudrate, 115200);
   pn.param<int>("fixed_imu_rate", SensorImuRate, 800);
+  pn.param<int>("syncout_rate", SyncOutRate, 10);
+  pn.param<int>("syncout_length_ms", SyncOutLengthMS, 10);
 
   //Call to set covariances
   if (pn.getParam("linear_accel_covariance", rpc_temp)) {
@@ -204,9 +277,6 @@ int main(int argc, char * argv[])
 
   // try to optimize the serial port
   optimize_serial_communication(SensorPort);
-
-  // Create a VnSensor object and connect to sensor
-  VnSensor vs;
 
   // Default baudrate variable
   int defaultBaudrate;
@@ -298,6 +368,22 @@ int main(int argc, char * argv[])
   // Make sure no generic async output is registered
   vs.writeAsyncDataOutputType(VNOFF);
 
+  // Setting trigger_out. by default - no trigger
+  _syncout_counter_driver = 0;
+  try
+  {
+    vn::sensors::SynchronizationControlRegister sync_control;
+    sync_control.syncOutMode = vn::protocol::uart::SyncOutMode::SYNCOUTMODE_NONE;
+    vs.writeSynchronizationControl(sync_control);
+  }
+  catch(...)
+  {
+    // Disconnect if we had the wrong default and we were connected
+    vs.disconnect();
+    ROS_INFO("Error setting syncout register");
+    exit(-1);
+  }
+
   // Configure binary output message
   BinaryOutputRegister bor(
     ASYNCMODE_PORT1,
@@ -305,7 +391,8 @@ int main(int argc, char * argv[])
     COMMONGROUP_QUATERNION | COMMONGROUP_YAWPITCHROLL | COMMONGROUP_ANGULARRATE |
       COMMONGROUP_POSITION | COMMONGROUP_ACCEL | COMMONGROUP_MAGPRES |
       (user_data.adjust_ros_timestamp ? COMMONGROUP_TIMESTARTUP : 0),
-    TIMEGROUP_NONE | TIMEGROUP_GPSTOW | TIMEGROUP_GPSWEEK | TIMEGROUP_TIMEUTC, IMUGROUP_NONE,
+    TIMEGROUP_NONE | TIMEGROUP_GPSTOW | TIMEGROUP_GPSWEEK | TIMEGROUP_TIMEUTC | TIMEGROUP_SYNCOUTCNT | TIMEGROUP_TIMESTARTUP,
+    IMUGROUP_NONE,
     GPSGROUP_NONE,
     ATTITUDEGROUP_YPRU,  //<-- returning yaw pitch roll uncertainties
     INSGROUP_INSSTATUS | INSGROUP_POSECEF | INSGROUP_VELBODY | INSGROUP_ACCELECEF |
@@ -762,6 +849,20 @@ void BinaryAsyncMessageReceived(void * userData, Packet & p, size_t index)
   vn::sensors::CompositeData cd = vn::sensors::CompositeData::parse(p);
   UserData * user_data = static_cast<UserData *>(userData);
   ros::Time time = get_time_stamp(cd, user_data, ros_time);
+
+
+  if(cd.hasSyncOutCnt())
+  {
+    if(cd.syncOutCnt() > _syncout_counter_imu)
+    {
+        _syncout_counter_imu = cd.syncOutCnt();
+        ROS_DEBUG("syncout event from IMU");
+        _syncout_message.frame_id = "imu_syncout";
+        _syncout_message.seq = _syncout_counter_driver++;
+        _syncout_message.stamp = time;
+        _syncout_publisher.publish(_syncout_message);
+    }
+  }
 
   // IMU
   if ((pkg_count % user_data->imu_stride) == 0 && pubIMU.getNumSubscribers() > 0) {

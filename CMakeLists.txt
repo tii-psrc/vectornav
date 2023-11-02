@@ -1,7 +1,11 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 2.8.12)
+
 # Compile options so compiles with ROS Kinetic
 # Future releases may want to 
-add_compile_options(-std=c++11)
+#add_compile_options(-std=c++11)
+
+cmake_policy(SET CMP0048 NEW)
+
 project(vectornav)
 
 ## Find catkin macros and libraries
@@ -10,6 +14,8 @@ project(vectornav)
 find_package(catkin REQUIRED COMPONENTS
     roscpp
     message_generation
+    tf2
+    tf2_geometry_msgs
 )
 
 add_message_files(
@@ -37,6 +43,7 @@ catkin_package(
 ###########
 
 #include(vnproglib-1.1/cpp/CMakeLists.txt)
+# this adds libvncxx library target
 add_subdirectory(vnproglib-1.2.0.0/cpp)
 
 ## Specify additional locations of header files
